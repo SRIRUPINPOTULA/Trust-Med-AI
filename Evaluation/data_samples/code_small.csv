@@ -1,0 +1,15 @@
+problem_id,prompt,starter,tests
+fact_01,"Implement function solve(n) that returns factorial of n (0<=n<=10).","def solve(n):
+    # TODO
+    return 1","
+ALL_PASS = True
+DETAILS = []
+for x,y in [(0,1),(1,1),(2,2),(3,6),(5,120),(10,3628800)]:
+    try:
+        res = solution.solve(x)
+        if res != y:
+            ALL_PASS = False
+            DETAILS.append(f'fail: {x}->{res}, want {y}')
+    except Exception as e:
+        ALL_PASS = False
+        DETAILS.append(f'error: {x}: {e}')

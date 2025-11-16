@@ -1,0 +1,4 @@
+prompt,topic,length_bucket,difficulty,gold
+"What is Big-O of binary search?",algorithms,short,easy,O(log n)
+"Explain CAP theorem briefly.",systems,short,medium,"Consistency, Availability, Partition tolerance; you can have only two under partitions."
+"Write a one-sentence summary of gradient descent.",ml,short,easy,"Iteratively updates parameters opposite the gradient of the loss to minimize it."
