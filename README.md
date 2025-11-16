@@ -77,110 +77,172 @@ python train_lora_masked.py --model Qwen/Qwen2.5-1.5B-Instruct --data ./dataset/
 
 # Step 4: Launch the chatbot
 python app.py
+```
 
-## 🧩 Environment Variables (for `app.py`)
+# 🧪 **Model Evaluation Guide (README)**
 
-| **Variable** | **Description** | **Default** |
-|---------------|------------------|--------------|
-| `CONTEXT_CSV` | Path to cleaned triples CSV | `kg_out/triples_clean.csv` |
-| `BASE_MODEL` | Base Hugging Face model | `Qwen/Qwen2.5-1.5B-Instruct` |
-| `ADAPTER_DIR` | Directory of LoRA adapter | *(empty)* |
-| `SKIP_LORA` | Skip loading LoRA (`1/true/yes`) | `0` |
-| `FORCE_DEVICE` | Force compute device (`cpu`, `cuda`, `mps`) | Auto-detected |
+This guide shows you how to evaluate your **LoRA‑trained** model versus the **base** model on fixed validation and training splits, then run **judge‑free A/B testing** with per‑example F1 and a **paired bootstrap CI** for the F1 lift.
 
----
+# 📁 **Before You Start**
 
-## 🧪 Model Evaluation Guide
-
-To evaluate your **LoRA-trained** and **base models**, follow the steps below.
-
-Before starting, **change to your evaluation directory**:
+* Change into your evaluation directory:
 
 ```bash
-cd /path/to/your/evaluation/directory
-⚙️ 0) One-Time Setup
+cd Evaluation/
+```
 
-Make required packages importable and install dependencies:
+* (Optional but recommended) ensure the output folder exists:
 
+```bash
+mkdir -p results
+```
+
+# ⚙️ **0) One‑Time Setup**
+
+Make packages importable and install dependencies.
+
+```bash
 # make packages importable
 touch adapters/__init__.py scripts/__init__.py
 
 # install dependencies
 pip install -r requirements.txt
+```
 
-🧩 1) Evaluate LoRA (Trained) on Validation & Training Sets
+# 🧩 **1) Evaluate LoRA (Trained) on Validation & Training Sets**
+
+## 🔧 **Environment**
+
+```bash
 export EVAL_MODE=hf_local
 export BASE_MODEL_ID=Qwen/Qwen2.5-1.5B-Instruct
 export LORA_ADAPTER_PATH=/Users/srirupin/Desktop/SWM/SWM_Evaluation/kg_lora_out_chat
 export HF_DEVICE=mps   # or: cpu
+```
 
+## 🫧 **Sanity Check (quick smoke test)**
 
-Sanity Check:
-
+```bash
 python -m scripts.smoke_infer "Say hi in one sentence."
+```
 
+## ✅ **Validation Set (Full metrics — ROUGE, BERT)**
 
-Evaluate on Validation Set (Full Metrics — ROUGE, BERT):
-
+```bash
 python -m scripts.eval_med_jsonl \
   --data ./kg_dataset/val.jsonl \
   --out results/med_val_eval_full.jsonl \
   --use_input --add_rouge --add_bert
+```
 
+## ✅ **Training Set (Full metrics — ROUGE, BERT)**
 
-Evaluate on Training Set (Full Metrics — ROUGE, BERT):
-
+```bash
 python -m scripts.eval_med_jsonl \
   --data ./kg_dataset/train.jsonl \
   --out results/med_train_eval_full.jsonl \
   --use_input --add_rouge --add_bert
+```
 
-🧠 2) Evaluate Base (Standard) Model on the Same Splits
+# 🧠 **2) Evaluate Base (Standard) Model on the Same Splits**
 
-Unset the LoRA adapter path to disable adapter loading:
+Disable LoRA by unsetting the adapter path, then rerun on the same data.
 
-unset LORA_ADAPTER_PATH             # IMPORTANT: disables LoRA
+## 🔧 **Environment (Base only)**
+
+```bash
+unset LORA_ADAPTER_PATH   # IMPORTANT: disables LoRA
 export BASE_MODEL_ID=Qwen/Qwen2.5-1.5B-Instruct
-export HF_DEVICE=mps   # or: cpu
+export HF_DEVICE=mps      # or: cpu
+```
 
+## ✅ **Validation Set (Full metrics — ROUGE, BERT)**
 
-Validation Evaluation:
-
+```bash
 python -m scripts.eval_med_jsonl \
   --data ./kg_dataset/val.jsonl \
   --out results/base_val_eval_full.jsonl \
   --use_input --add_rouge --add_bert
+```
 
+## ✅ **Training Set (Full metrics — ROUGE, BERT)**
 
-Training Evaluation:
-
+```bash
 python -m scripts.eval_med_jsonl \
   --data ./kg_dataset/train.jsonl \
   --out results/base_train_eval_full.jsonl \
   --use_input --add_rouge --add_bert
+```
 
-🔍 Quick Result Check
+# 🔎 **Quick Result Check**
+
+Peek at the last (most recent) record in each JSONL to confirm the job completed and metrics are present.
+
+```bash
 tail -n 1 results/med_val_eval_full.jsonl
+
 tail -n 1 results/base_val_eval_full.jsonl
+```
 
-📊 3) (Option A) Judge-Free A/B Testing Using Per-Example F1 + Bootstrap CI
+> Tip: Each line is a self‑contained JSON object (per‑example or aggregate, depending on your script). Keep these around for downstream analysis.
 
-Per-example winners by F1 score:
+# 📊 **3) Judge‑Free A/B Testing — Per‑Example F1 + Bootstrap CI**
 
+Quantify how much the LoRA adapter helps (or hurts) on the **same** examples.
+
+## 🥇 **Per‑Example Winners by F1**
+
+```bash
 python -m scripts.ab_pref_f1_fast \
   --a results/base_val_eval_full.jsonl \
   --b results/med_val_eval_full.jsonl
+```
 
+## 📈 **Paired Bootstrap CI for F1 Lift (LoRA − Base)**
 
-Paired bootstrap confidence interval for F1 lift (LoRA − Base):
-
+```bash
 python -m scripts.paired_bootstrap_ci \
   --a_jsonl results/base_val_eval_full.jsonl \
   --b_jsonl results/med_val_eval_full.jsonl \
   --iters 5000 \
   --out results/f1_lift_val.jsonl
+```
 
+### 🔍 **Check the final lift**
 
-Check the final F1 lift results:
-
+```bash
 tail -n 1 results/f1_lift_val.jsonl
+```
+
+> Interpretation: a **positive** F1 lift means LoRA outperforms the base model on average; a **negative** lift means the base model is better. The bootstrap CI tells you how stable that estimate is across resamples of the same validation set.
+
+# 🧰 **Troubleshooting & Tips**
+
+* **No MPS on this machine**: set `export HF_DEVICE=cpu`.
+* **macOS MPS memory issues**: close GPU‑heavy apps; if you still see allocation errors, try smaller batch sizes in your scripts.
+* **Missing metrics packages**: make sure `requirements.txt` includes any metric deps (e.g., ROUGE, BERTScore). Re‑run `pip install -r requirements.txt` if needed.
+* **Results folder not found**: create it with `mkdir -p results` before running.
+
+# ♻️ **Reproducibility Checklist**
+
+* Record the exact values of these env vars in your run logs: `EVAL_MODE`, `BASE_MODEL_ID`, `LORA_ADAPTER_PATH` (for LoRA runs), `HF_DEVICE`.
+* Keep the exact commit hash of this repo and the versions from `pip freeze`.
+* Archive the produced `results/*.jsonl` files alongside the dataset snapshot used (`./kg_dataset/{train,val}.jsonl`).
+
+# 📦 **What You Should Have After Completing the Guide**
+
+* LoRA eval artifacts:
+
+  * `results/med_val_eval_full.jsonl`
+  * `results/med_train_eval_full.jsonl`
+* Base eval artifacts:
+
+  * `results/base_val_eval_full.jsonl`
+  * `results/base_train_eval_full.jsonl`
+* A/B testing artifact:
+
+  * `results/f1_lift_val.jsonl` (paired bootstrap CI summary for F1 lift)
+
+# ✅ **Done!**
+
+You now have a clean, repeatable process for comparing **LoRA vs. Base** with **full metrics** and a **statistically principled** F1 lift estimate. Commit this README with your results so collaborators can reproduce and review your evaluation end‑to‑end.
