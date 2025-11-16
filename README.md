@@ -242,7 +242,3 @@ tail -n 1 results/f1_lift_val.jsonl
 * A/B testing artifact:
 
   * `results/f1_lift_val.jsonl` (paired bootstrap CI summary for F1 lift)
-
-# ✅ **Done!**
-
-You now have a clean, repeatable process for comparing **LoRA vs. Base** with **full metrics** and a **statistically principled** F1 lift estimate. Commit this README with your results so collaborators can reproduce and review your evaluation end‑to‑end.
