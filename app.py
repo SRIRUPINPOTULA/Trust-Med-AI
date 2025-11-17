@@ -1,54 +1,68 @@
 # app.py
 # -----------------------------------------------------------------------------
-# TrustMed AI — Conversational Agent (entity-locked + device override + timeout)
-# + Qwen chat template + KG summarizer fallback + treats-filter + grammar fixes
-# + phrase-aware entity detection & strict entity filtering
-# + KG sanitization + intent cascade + output validation
+# TrustMed AI — Conversational Agent (Gradio)
+# Now using alias-aware, intent-specific, KG-constrained answering logic
+# similar to your CLI pattern (knowledge lines + allowed entities + bullet output),
+# with deterministic KG-only fallback and a clean disclaimer section.
 # -----------------------------------------------------------------------------
 
 import os
 import re
-import time
+from typing import List, Tuple, Optional, Set, Dict
+
 import pandas as pd
 import gradio as gr
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-# ============================ Config ============================
-
+# =============== Config ===============
 CONTEXT_CSV = os.getenv("CONTEXT_CSV", "kg_out/triples_clean.csv")
 BASE_MODEL  = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
-ADAPTER_DIR = os.getenv("ADAPTER_DIR", "")  # optional LoRA path
+ADAPTER_DIR = os.getenv("ADAPTER_DIR", "")   # optional LoRA path
 SKIP_LORA   = os.getenv("SKIP_LORA", "0").lower() in ("1","true","yes")
+FORCE_DEVICE = os.getenv("FORCE_DEVICE", "").lower()  # "cpu" | "mps" | "cuda" (auto if unset)
 
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "160"))  # lowered for speed
-TOP_K = int(os.getenv("TOP_K", "20"))
-REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.1"))
-
-# Generation timeout (seconds) — if we exceed it, we return KG-only
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "160"))
 GEN_TIMEOUT_SECS = int(os.getenv("GEN_TIMEOUT_SECS", "45"))
-
-# Force device: "cpu" | "mps" | "cuda" (auto if unset)
-FORCE_DEVICE = os.getenv("FORCE_DEVICE", "").lower()
+BULLETS_DEFAULT = int(os.getenv("BULLETS", "4"))
 
 DISCLAIMER = (
     "⚠️ I am a research assistant and not a medical professional. "
     "This is informational and not medical advice. For urgent or personal care, consult a licensed clinician."
 )
 
-# ======================= Intent & Guardrails =====================
+# =============== Aliases & Relations ===============
+ALIAS_CLUSTERS: Dict[str, Set[str]] = {
+    # Type 2 diabetes
+    "type 2 diabetes": {
+        "type 2 diabetes", "type-2 diabetes", "t2d", "t2dm",
+        "type ii diabetes", "dm2", "diabetes mellitus type 2",
+    },
+    # Strep throat
+    "strep throat": {
+        "strep throat", "streptococcal pharyngitis", "group a strep pharyngitis",
+        "gas pharyngitis", "streptococcus pyogenes pharyngitis", "strep a pharyngitis",
+    },
+    # Hay fever
+    "hay fever": {
+        "hay fever", "allergic rhinitis", "seasonal allergic rhinitis",
+    },
+}
 
-def classify_intent(q: str) -> str:
-    ql = q.lower()
-    if any(k in ql for k in ["treat", "therapy", "manage", "medication", "drug", "intervention"]):
-        return "treats"
-    if any(k in ql for k in ["cause", "risk", "etiology"]):
-        return "caused_by"
-    if "side effect" in ql or "adverse" in ql or "reaction" in ql:
-        return "side_effect"
-    if "symptom" in ql or "sign" in ql:
-        return "symptom_of"
-    return "general"
+REL_GROUPS = {
+    "treats": {
+        "TREATS", "TREATED_BY", "INDICATION_FOR", "MANAGES", "THERAPY_FOR"
+    },
+    "caused_by": {
+        "CAUSED_BY", "CAUSES", "ETIOLOGY", "RESULT_OF", "DUE_TO"
+    },
+    "symptom_of": {
+        "HAS_SYMPTOM", "SYMPTOM_OF", "PRESENTS_WITH", "SIGN_OF"
+    },
+    "side_effect": {
+        "HAS_SIDE_EFFECT", "SIDE_EFFECT_OF", "ADVERSE_EVENT", "ADVERSE_EFFECT"
+    },
+}
 
+# =============== Intent & Emergencies ===============
 RED_FLAGS = [
     "chest pain", "shortness of breath", "anaphylaxis", "stroke",
     "suicidal", "overdose", "severe bleeding", "unconscious"
@@ -58,360 +72,156 @@ def emergency_filter(q: str) -> bool:
     ql = q.lower()
     return any(flag in ql for flag in RED_FLAGS)
 
-# ===================== Data loading / sanitization ==================
 
-# Sanitizer for odd bytes (NBSP/replacement char)
+def classify_intent(q: str) -> str:
+    ql = q.lower()
+    if any(w in ql for w in ["treat", "therapy", "manage", "medication", "drug", "intervention"]):
+        return "treats"
+    if any(w in ql for w in ["cause", "risk", "etiolog", "due to", "result of"]):
+        return "caused_by"
+    if any(w in ql for w in ["symptom", "sign"]):
+        return "symptom_of"
+    if any(w in ql for w in ["side effect", "adverse", "reaction"]):
+        return "side_effect"
+    return "treats"  # helpful default
+
+# =============== Light sanitization ===============
 _SAN_BAD = re.compile(r"[\uFFFD\u00A0]")
 
-# Extra filters for fragment-y/junky rows
-_BAD_STARTS = re.compile(r"^(for example|eg\.|e\.g\.|example:|note:)\b", re.I)
-_TRAIL_TO = re.compile(r"\b(to|used to)\s*$", re.I)
-_MANY_COMMAS = re.compile(r"(?:[^,]*,){3,}")  # 3+ commas → clause dump
-_NON_WORDY = re.compile(r"^[^a-zA-Z]*$")
-
 def _sanitize(s: str) -> str:
-    return _SAN_BAD.sub(" ", (s or "")).replace("â", "").strip()
+    return _SAN_BAD.sub(" ", str(s)).strip()
 
-_QWORD_RX = re.compile(r"^\s*(what|which|how|when|where|why)\b", re.I)
-_HAS_QMARK_RX = re.compile(r"\?\s*$")
-_HAS_URL_RX = re.compile(r"https?://|www\.", re.I)
-_FIRST_PERSON_RX = re.compile(r"\b(I|my|me|we|our|us)\b", re.I)
-_MIN_LEN = 3
-_MAX_LEN = 220
+# =============== Entity helpers ===============
 
-def _row_is_noisy(h: str, t: str) -> bool:
-    if _QWORD_RX.search(h) or _QWORD_RX.search(t) or _HAS_QMARK_RX.search(h) or _HAS_QMARK_RX.search(t):
-        return True
-    if _HAS_URL_RX.search(h) or _HAS_URL_RX.search(t):
-        return True
-    if _FIRST_PERSON_RX.search(h) or _FIRST_PERSON_RX.search(t):
-        return True
-    if not (_MIN_LEN <= len(h) <= _MAX_LEN) or not (_MIN_LEN <= len(t) <= _MAX_LEN):
-        return True
-    if _BAD_STARTS.search(h) or _BAD_STARTS.search(t):
-        return True
-    if _TRAIL_TO.search(h) or _TRAIL_TO.search(t):
-        return True
-    if _NON_WORDY.match(h) or _NON_WORDY.match(t):
-        return True
-    if _MANY_COMMAS.search(h) or _MANY_COMMAS.search(t):
-        return True
-    return False
-
-def sanitize_triples(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for col in ("head","relation","tail"):
-        df[col] = df[col].astype(str).map(_sanitize)
-    mask = ~df.apply(lambda r: _row_is_noisy(r["head"], r["tail"]), axis=1)
-    df = df[mask].drop_duplicates(subset=["head","relation","tail"]).reset_index(drop=True)
-    return df
-
-def load_triples(csv_path: str) -> pd.DataFrame:
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Missing CSV: {csv_path}")
-    df = pd.read_csv(csv_path)
-    df.columns = [c.lower() for c in df.columns]
-    for col in ["head", "relation", "tail"]:
-        if col not in df.columns:
-            raise ValueError("Expected columns: head, relation, tail")
-    df = sanitize_triples(df)
-    return df
-
-# ===================== Entity utilities =====================
-
-STOPWORDS = {
-    "what","whats","the","a","an","for","of","in","to","on","and","or","is","are","how",
-    "does","do","with","about","tell","me","please","can","you","i","we","it","that"
-}
-DOMAIN_STOP = {
-    "treat","treats","treatment","treatments","treated","therapy","therapies",
-    "management","manage","managing","medication","medications","drug","drugs",
-    "symptom","symptoms","sign","signs","cause","causes","risk","risks","infection","infections",
-    "disease","disorder","syndrome","pain","care","doctor","nurse","clinic","consult","guidance"
-}
-DISEASE_SUFFIX_RE = re.compile(r"(itis|osis|emia|algia|oma|pathy|phobia|plegia|rrhea|rrhoea)$")
-
-def tokenize_question(q: str):
-    toks_all = [t for t in re.findall(r"[a-z0-9\-]+", q.lower()) if len(t) > 2]
-    return [t for t in toks_all if t not in STOPWORDS]
-
-def count_token_hits(df: pd.DataFrame, tok: str) -> int:
-    head_hit = df["head"].astype(str).str.lower().str.contains(tok, regex=False)
-    tail_hit = df["tail"].astype(str).str.lower().str.contains(tok, regex=False)
-    return int((head_hit | tail_hit).sum())
-
-def _make_ngrams(tokens, nmin=2, nmax=3):
-    for n in range(nmin, nmax + 1):
-        for i in range(0, len(tokens) - n + 1):
-            yield " ".join(tokens[i:i+n])
-
-def _phrase_hits_in_kg(df: pd.DataFrame, phrase: str) -> int:
-    words = phrase.split()
-    if not words:
-        return 0
-    prefix = " ".join(map(re.escape, words[:-1]))
-    last = re.escape(words[-1]) + r"(?:s|es)?"
-    pat = rf"\b{prefix}\s+{last}\b" if prefix else rf"\b{last}\b"
-    rx = re.compile(pat, flags=re.I)
-    head_hit = df["head"].astype(str).str.contains(rx, na=False)
-    tail_hit = df["tail"].astype(str).str.contains(rx, na=False)
-    return int((head_hit | tail_hit).sum())
-
-def _compile_entity_regex(entity: str) -> re.Pattern:
-    """
-    Acronyms/short tokens (<=3 chars or ALL CAPS) match EXACTLY.
-    Longer words allow simple plurals (s|es) only.
-    """
-    words = entity.split()
-    def tok(w: str) -> str:
-        is_acronym = (w.isupper() and len(w) <= 6) or len(w) <= 3
-        if is_acronym:
-            return r"\b" + re.escape(w) + r"\b"
-        return r"\b" + re.escape(w) + r"(?:s|es)?\b"
-    if len(words) == 1:
-        return re.compile(tok(words[0]), flags=re.I)
-    prefix = r"\b" + r"\s+".join(map(re.escape, words[:-1])) + r"\s+"
-    last = tok(words[-1]).lstrip(r"\b")
-    return re.compile(prefix + last, flags=re.I)
-
-def pick_main_entity(df: pd.DataFrame, q: str) -> str | None:
-    toks = tokenize_question(q)
-    singles = [t for t in toks if t not in DOMAIN_STOP and len(t) >= 3]
-    disease_like = [t for t in singles if DISEASE_SUFFIX_RE.search(t)]
-    single_pool = disease_like if disease_like else singles
-    phrases = list(_make_ngrams(singles, 2, 3))
-
-    best_phrase, best_p_hits = None, 0
-    for ph in phrases:
-        hits = _phrase_hits_in_kg(df, ph)
-        if hits > best_p_hits:
-            best_phrase, best_p_hits = ph, hits
-    if best_p_hits > 0:
-        return best_phrase
-
-    if not single_pool:
-        return None
-    scored = [(t, count_token_hits(df, t)) for t in single_pool]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    ent = scored[0][0] if scored and scored[0][1] > 0 else None
-    if ent:
-        return ent
-    # Fallback: trust obvious condition mentions even if KG has no hits
-    q_low = q.lower()
-    obvious = [w for w in re.findall(r"[A-Za-z0-9\-]+", q) if w.isupper() or w.lower() in {"hiv","aids","covid","copd","uti","ibd","ibs"}]
-    if obvious:
-        return obvious[0].lower()
-    if "hiv" in q_low:
-        return "hiv"
+def detect_entity(q: str) -> Optional[str]:
+    ql = q.lower()
+    for canon, aliases in ALIAS_CLUSTERS.items():
+        if any(a in ql for a in aliases):
+            return canon
+    if "diabetes" in ql and ("type 2" in ql or "type-2" in ql or "ii" in ql or "t2" in ql):
+        return "type 2 diabetes"
+    if "strep" in ql or "pharyngitis" in ql:
+        return "strep throat"
+    if "hay fever" in ql or ("allergic" in ql and "rhinitis" in ql):
+        return "hay fever"
     return None
 
-# ===================== Retrieval & scoring =====================
 
-def _treat_hint_mask(frame: pd.DataFrame):
-    pat = r"\b(treat|treatment|medication|steroid|corticosteroid|antibiotic|antifungal|antiviral|antiretroviral|haart|art|arv)\b"
-    head = frame["head"].astype(str).str.contains(pat, case=False, regex=True, na=False)
-    tail = frame["tail"].astype(str).str.contains(pat, case=False, regex=True, na=False)
-    return head | tail
+def expand_aliases(entity: Optional[str]) -> Set[str]:
+    if not entity:
+        return set()
+    e = entity.lower().strip()
+    if e in ALIAS_CLUSTERS:
+        return set(ALIAS_CLUSTERS[e])
+    for canon, aliases in ALIAS_CLUSTERS.items():
+        if e in aliases:
+            return set(aliases)
+    return {e}
 
-def retrieve_triples(df: pd.DataFrame, question: str, intent: str, main_entity: str | None, k: int = TOP_K) -> pd.DataFrame:
-    toks = tokenize_question(question)
-    dfx = df.copy()
+# =============== Relation normalization ===============
 
-    # For treatment questions, we must know the entity (prevents irrelevant facts)
-    if intent == "treats" and not main_entity:
-        return pd.DataFrame(columns=df.columns)
+def normalize_relation(r: str) -> str:
+    rl = str(r or "").lower()
+    if any(k in rl for k in ["treat", "indication", "manage", "therapy"]):
+        return "TREATS"
+    if any(k in rl for k in ["cause", "etiolog", "due to", "result"]):
+        return "CAUSED_BY"
+    if any(k in rl for k in ["symptom", "sign", "presents with"]):
+        return "HAS_SYMPTOM"
+    if any(k in rl for k in ["side effect", "adverse", "reaction"]):
+        return "HAS_SIDE_EFFECT"
+    return rl.upper()
 
-    if "relation" in dfx.columns and intent != "general":
-        dfx.loc[:, "rel_boost"] = dfx["relation"].astype(str).str.lower().apply(lambda r: 1 if intent in r else 0)
+# =============== Triple selection (alias + intent) ===============
+
+def _row_mentions_any(text: str, needles: Set[str]) -> bool:
+    tl = text.lower()
+    return any(n in tl for n in needles)
+
+
+def select_triples(df: pd.DataFrame, q: str, intent: str, entity: Optional[str], max_triples: int = 20) -> List[Tuple[str,str,str]]:
+    if df.empty:
+        return []
+    rels = REL_GROUPS.get(intent, set())
+    if not rels:
+        rels = set().union(*REL_GROUPS.values())
+
+    cand = df.copy()
+    cand["rel_norm"] = cand["relation"].map(normalize_relation)
+    cand = cand[cand["rel_norm"].isin(rels)]
+
+    aliases = expand_aliases(entity)
+    if aliases:
+        mask = cand.apply(lambda r: _row_mentions_any(str(r["head"]), aliases) or _row_mentions_any(str(r["tail"]), aliases), axis=1)
+        cand = cand[mask]
     else:
-        dfx.loc[:, "rel_boost"] = 0
+        # loose: any overlap with query tokens
+        qtok = set(re.findall(r"[a-z0-9\-+]+", q.lower()))
+        loose = {t for t in qtok if len(t) >= 3}
+        mask = cand.apply(lambda r: _row_mentions_any(str(r["head"]), loose) or _row_mentions_any(str(r["tail"]), loose), axis=1)
+        cand = cand[mask]
 
-    # Prefer treat*; otherwise soft treatment hints
-    if intent == "treats":
-        treat_mask = dfx["relation"].astype(str).str.lower().str.contains("treat", na=False)
-        dfx_treats = dfx[treat_mask].copy()
-        if not dfx_treats.empty:
-            dfx = dfx_treats
-        else:
-            hint_mask = _treat_hint_mask(dfx)
-            dfx_hints = dfx[hint_mask].copy()
-            if not dfx_hints.empty:
-                dfx = dfx_hints
+    if cand.empty:
+        return []
 
-    # Strict entity filter
-    ent_rx = _compile_entity_regex(main_entity) if main_entity else None
-    if ent_rx is not None:
-        ent_mask = (
-            dfx["head"].astype(str).str.contains(ent_rx, na=False) |
-            dfx["tail"].astype(str).str.contains(ent_rx, na=False)
-        )
-        dfx = dfx[ent_mask].copy()
-        if dfx.empty:
-            return dfx
-
-        # Special case: avoid HIV≈hives collisions
-        if (main_entity or "").lower() == "hiv":
-            HIVES_RX = re.compile(r"\bhives?\b", re.I)
-            bad = dfx["head"].astype(str).str.contains(HIVES_RX, na=False) | dfx["tail"].astype(str).str.contains(HIVES_RX, na=False)
-            if bad.any():
-                dfx = dfx[~bad].copy()
-                if dfx.empty:
-                    return dfx
-
-    # For treats, prefer rows where entity appears in tail and drop diagnostic/fitness clutter
-    if intent == "treats" and ent_rx is not None and "tail" in dfx.columns:
-        prefer_tail = dfx["tail"].astype(str).str.contains(ent_rx, na=False)
-        if prefer_tail.any():
-            dfx = dfx[prefer_tail].copy()
-        BAD_TREAT_HEAD_RX = re.compile(r"\b(diagnose|diagnosis|monitor|know when|doctor will|exercise|exercises|stand about|podiatrist)\b", re.I)
-        bad_head = dfx["head"].astype(str).str.contains(BAD_TREAT_HEAD_RX, na=False)
-        if bad_head.any():
-            dfx = dfx[~bad_head].copy()
-            if dfx.empty:
-                return dfx
-
+    # scoring
+    qtokens = set(re.findall(r"[a-z0-9\-+]+", q.lower())) | aliases
     def score_row(r):
-        h = str(r.get("head","")).lower()
-        t = str(r.get("tail","")).lower()
-        base = 0
-        for tok in toks:
-            if tok in DOMAIN_STOP:
-                continue
-            if tok in h or tok in t:
-                base += 2 if len(tok) >= 6 else 1
-        if ent_rx is not None and (ent_rx.search(h) or ent_rx.search(t)):
-            base += 5
-        base += 2 * r["rel_boost"]
-        return base
+        text = f"{r['head']} {r['tail']} {r['relation']}".lower()
+        hits = sum(1 for t in qtokens if t in text)
+        w = float(r.get("weight", 1.0))
+        tail_bonus = 1.0
+        if intent == "treats" and aliases:
+            if _row_mentions_any(str(r["tail"]), aliases):
+                tail_bonus = 1.5
+        return hits * 10 * tail_bonus + w
 
-    dfx.loc[:, "score"] = dfx.apply(score_row, axis=1)
-    dfx = dfx.sort_values("score", ascending=False)
-    return dfx[dfx["score"] > 0].head(k).copy()
+    cand["score"] = cand.apply(score_row, axis=1)
+    cand = cand.sort_values("score", ascending=False).head(max_triples)
 
-# ---- Intent cascade ----
+    triples = list(zip(map(_sanitize, cand["head"]), map(_sanitize, cand["relation"]), map(_sanitize, cand["tail"])) )
+    return triples
 
-INTENT_NEIGHBORS = {
-    "treats": ["treats"],  # no pivot for treatment questions
-    "symptom_of": ["symptom_of", "caused_by", "treats", "general"],
-    "caused_by": ["caused_by", "symptom_of", "treats", "general"],
-    "side_effect": ["side_effect", "treats", "general"],
-    "general": ["treats", "caused_by", "symptom_of", "general"],
-}
+# =============== Prompt construction (knowledge-constrained) ===============
 
-def retrieve_with_cascade(df: pd.DataFrame, question: str, intent: str, main_entity: str | None, k: int = TOP_K):
-    tried = []
-    best_rows = pd.DataFrame()
-    best_intent = intent
-    for it in INTENT_NEIGHBORS.get(intent, [intent]):
-        rows = retrieve_triples(df, question, intent=it, main_entity=main_entity, k=k)
-        tried.append((it, len(rows)))
-        if len(rows) >= 2:
-            return rows, it, tried
-        if not rows.empty and best_rows.empty:
-            best_rows, best_intent = rows, it
-    return best_rows, best_intent, tried
-
-def format_context(rows: pd.DataFrame, max_facts: int = 20) -> str:
-    if rows is None or rows.empty:
-        return "(no facts)"
-    lines = []
-    for _, r in rows.iterrows():
-        h = _sanitize(str(r.get("head", "")))
-        rel = _sanitize(str(r.get("relation", "")))
-        t = _sanitize(str(r.get("tail", "")))
-        lines.append(f"[H:{h} | R:{rel} | T:{t}]")
-        if len(lines) >= max_facts:
-            break
-    return "\n".join(lines)
-
-# ================= Prompt & post-processing / parsing =============
-
-PROMPT_TMPL = """You are TrustMed, a careful medical information assistant.
-Use ONLY the facts listed in <CONTEXT>. If information is missing, say you don't know.
-Do not add other knowledge. Do not include examples.
-Focus only on the condition: "{entity}". Ignore facts about other conditions.
-
-<QUESTION>
-{q}
-</QUESTION>
-
-<CONTEXT>
-{ctx}
-</CONTEXT>
-
-<OUTPUT_FORMAT>
-Begin immediately with:
-[Answer]
-- 2 to 5 clear sentences summarizing what the facts say about "{entity}". No speculation.
-
-[Facts Used]
-- 3 to 6 bullet points. Each bullet must be in the form: [H:head | R:relation | T:tail]
-- Use only facts that appear in <CONTEXT> and that mention "{entity}".
-
-[Disclaimer]
-- Exactly this line: {disc}
-</OUTPUT_FORMAT>
-"""
-
-def kg_only_response(ctx_rows: pd.DataFrame) -> str:
-    if ctx_rows is None or ctx_rows.empty:
-        return (
-            "[Answer]\nI don't have enough grounded information to answer that from the available knowledge graph.\n\n"
-            "[Facts Used]\n(none)\n\n"
-            f"[Disclaimer]\n{DISCLAIMER}"
-        )
-    bullets = []
-    for h, r, t in ctx_rows[["head", "relation", "tail"]].values[:6]:
-        bullets.append(f"- [H:{_sanitize(str(h))} | R:{_sanitize(str(r))} | T:{_sanitize(str(t))}]")
-    return (
-        "[Answer]\nThe following knowledge graph facts are relevant to your question. "
-        "I will not speculate beyond these facts.\n\n"
-        "[Facts Used]\n" + "\n".join(bullets) + "\n\n" +
-        f"[Disclaimer]\n{DISCLAIMER}"
+def build_prompt(question: str, triples: List[Tuple[str,str,str]], bullets: int = 4, intent: str = "treats") -> str:
+    knowledge_lines = [f"- {h} — {r} → {t}" for (h,r,t) in triples]
+    knowledge = "Knowledge (KG facts — use ONLY these):\n" + "\n".join(knowledge_lines) + "\n\n"
+    entities = sorted({h for h,_,_ in triples} | {t for _,_,t in triples})
+    entity_list = "Allowed entities: " + ", ".join(entities[:80]) + ".\n\n"
+    intent_phrase = {
+        "treats": "List evidence-backed treatments/medications.",
+        "caused_by": "List main causes/etiologies.",
+        "symptom_of": "List common symptoms/signs.",
+        "side_effect": "List known side effects/adverse effects.",
+    }.get(intent, "Answer briefly.")
+    system = (
+        "Instruction: You are a careful medical assistant. "
+        f"Answer in {bullets}-{bullets+2} concise bullet points. "
+        f"{intent_phrase} Use ONLY the allowed entities; do NOT invent new facts. "
+        "Do NOT add a disclaimer line; it will be added separately.\n"
     )
+    return f"{system}{knowledge}{entity_list}Question: {question}\nAnswer:"
 
-def extract_three_sections(text: str) -> str | None:
-    m = re.search(r"\[Answer\].*?\[Facts\s*Used\].*?\[Disclaimer\].*", text, flags=re.S | re.I)
-    if not m:
-        return None
-    out = m.group(0)
-    lines = out.splitlines()
-    clean = []
-    disclaimer_normed = False
+# =============== Post-processing (no disclaimer here) ===============
+
+def post_process_no_disc(text: str) -> str:
+    txt = text.strip()
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in txt.splitlines() if ln.strip()]
+    out, seen = [], set()
     for ln in lines:
-        if ln.strip().lower().startswith("[disclaimer]"):
-            clean.append("[Disclaimer]")
-            clean.append(DISCLAIMER)
-            disclaimer_normed = True
-            break
-        clean.append(ln)
-    out = "\n".join(clean).strip()
-    if "[Disclaimer]" not in out or not disclaimer_normed:
-        out += f"\n\n[Disclaimer]\n{DISCLAIMER}"
-    return out
+        low = ln.lower()
+        if "not medical advice" in low:
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(ln)
+    # keep at most ~10 lines
+    return "\n".join(out[:12])
 
-# -------- Output validation to avoid bad fragments --------
-_BAD_FACT_PATTERNS = [
-    re.compile(r"^\[H:\s*for example", re.I),
-    re.compile(r"\bused to\s*$", re.I),
-    re.compile(r"\bexample\b", re.I),
-]
-
-def output_looks_sus(raw_out: str) -> bool:
-    sect = re.search(r"\[Facts\s*Used\](.*?)(?:\n\[|$)", raw_out, flags=re.S|re.I)
-    if not sect:
-        return True
-    body = sect.group(1)
-    if len(body.strip()) == 0:
-        return True
-    for rx in _BAD_FACT_PATTERNS:
-        if rx.search(body):
-            return True
-    return False
-
-# ===================== Text generation (HF/PEFT) =================
-
-_textgen_pipe = None  # lazy global
+# =============== Text generation backend ===============
+_textgen_pipe = None
 
 def _pick_device_and_dtype():
     import torch
@@ -425,66 +235,13 @@ def _pick_device_and_dtype():
         else:
             dev = "cpu"
     if dev == "cuda":
-        dtype = torch.float16
+        dtype = "float16"
     elif dev == "mps":
-        dtype = torch.float32  # more stable
+        dtype = "float32"
     else:
-        dtype = torch.float32
+        dtype = "float32"
     return dev, dtype
 
-def build_generator(base_model: str, adapter_dir: str | None):
-    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-    import torch
-
-    device_str, dtype = _pick_device_and_dtype()
-    print(f"[INFO] Using device={device_str}, dtype={dtype}")
-
-    tok = AutoTokenizer.from_pretrained(base_model)
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        torch_dtype=dtype,
-        attn_implementation="eager",
-        device_map=None,
-        low_cpu_mem_usage=False,
-    )
-
-    if adapter_dir and os.path.isdir(adapter_dir) and not SKIP_LORA:
-        try:
-            from peft import PeftModel
-            base = PeftModel.from_pretrained(base, adapter_dir, is_trainable=False)
-            print(f"[INFO] Loaded LoRA adapter from: {adapter_dir}")
-        except Exception as e:
-            print(f"[WARN] Could not load LoRA adapter '{adapter_dir}': {e}. Continuing without adapter.")
-    elif SKIP_LORA:
-        print("[INFO] SKIP_LORA=1 → not loading adapter")
-
-    import torch
-    device = torch.device(device_str)
-    base.to(device).eval()
-
-    gen = pipeline(
-        "text-generation",
-        model=base,
-        tokenizer=tok,
-        max_new_tokens=MAX_NEW_TOKENS,
-        temperature=0.0,
-        top_p=1.0,
-        repetition_penalty=REPETITION_PENALTY,
-        do_sample=False,
-        device=device,
-        return_full_text=False,
-    )
-
-    # Warm-up
-    try:
-        _ = gen("[Answer]\n", max_new_tokens=1)[0]["generated_text"]
-        print("[INFO] Warm-up done")
-    except Exception as e:
-        print(f"[WARN] Warm-up failed: {e}")
-
-    # Attach tokenizer for prompt building
-    gen.tokenizer_ref = tok
-    return gen
 
 def ensure_pipe():
     global _textgen_pipe
@@ -493,278 +250,119 @@ def ensure_pipe():
     if not BASE_MODEL:
         return None
     try:
-        _textgen_pipe = build_generator(BASE_MODEL, ADAPTER_DIR or None)
-        return _textgen_pipe
+        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        import torch
+        device_str, _ = _pick_device_and_dtype()
+        tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+        base = AutoModelForCausalLM.from_pretrained(BASE_MODEL)
+        # Optional: LoRA
+        if ADAPTER_DIR and os.path.isdir(ADAPTER_DIR) and not SKIP_LORA:
+            try:
+                from peft import PeftModel
+                base = PeftModel.from_pretrained(base, ADAPTER_DIR, is_trainable=False)
+            except Exception:
+                pass
+        device = torch.device(device_str)
+        base.to(device).eval()
+        gen = pipeline(
+            "text-generation",
+            model=base,
+            tokenizer=tok,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=0.3,
+            top_p=0.9,
+            repetition_penalty=1.15,
+            do_sample=True,
+            device=device,
+            return_full_text=False,
+        )
+        _textgen_pipe = gen
     except Exception as e:
-        print(f"[WARN] Falling back to KG-only mode (generator init failed): {e}")
+        print(f"[WARN] Could not init generator: {e}")
         _textgen_pipe = None
-        return None
+    return _textgen_pipe
 
-# --------- Qwen chat-style prompt helpers ----------
+# =============== Deterministic KG-only (bullets) ===============
 
-def build_messages(question: str, ctx_txt: str, entity: str | None):
-    system = (
-        "You are TrustMed, a careful medical information assistant. "
-        "Use ONLY the facts listed in <CONTEXT>. If information is missing, say you don't know. "
-        "Do not add other knowledge. Do not include examples. "
-        f'Focus only on the condition: "{entity or "this condition"}". Ignore facts about other conditions. '
-        "You MUST reply using exactly the following three sections, in order, nothing else:\n\n"
-        "[Answer]\n- 2 to 5 clear sentences summarizing what the facts say about the condition. No speculation.\n\n"
-        "[Facts Used]\n- 3 to 6 bullet points. Each bullet must be in the form: [H:head | R:relation | T:tail]\n"
-        "- Use only facts that appear in <CONTEXT> and that mention the condition.\n\n"
-        f"[Disclaimer]\n- Exactly this line: {DISCLAIMER}"
-    )
-    user = (
-        "<QUESTION>\n" + question + "\n</QUESTION>\n\n"
-        "<CONTEXT>\n" + ctx_txt + "\n</CONTEXT>\n"
-    )
-    return [{"role": "system", "content": system},
-            {"role": "user", "content": user}]
+def kg_only_answer(triples: List[Tuple[str,str,str]], intent: str, entity: Optional[str]) -> str:
+    aliases = expand_aliases(entity)
+    items: List[str] = []
+    for h, r, t in triples:
+        R = normalize_relation(r)
+        if intent == "treats" and R in REL_GROUPS["treats"]:
+            if aliases and any(a in h.lower() for a in aliases):
+                items.append(t)
+            elif aliases and any(a in t.lower() for a in aliases):
+                items.append(h)
+            else:
+                items.append(h)
+        elif intent == "caused_by" and R in REL_GROUPS["caused_by"]:
+            items.append(t if R == "CAUSED_BY" else h)
+        elif intent == "symptom_of" and R in REL_GROUPS["symptom_of"]:
+            items.append(t if R == "HAS_SYMPTOM" else h)
+        elif intent == "side_effect" and R in REL_GROUPS["side_effect"]:
+            items.append(t if R == "HAS_SIDE_EFFECT" else h)
+    items = [s for s in map(_sanitize, items) if s]
+    items = list(dict.fromkeys(items))
+    bullets = "\n".join(f"- {m}" for m in items[:10]) if items else "- (no facts found in KG context)"
+    return bullets
 
-def build_prompt(question: str, ctx_txt: str, entity: str | None, tok=None) -> str:
-    if tok is not None and hasattr(tok, "apply_chat_template"):
-        msgs = build_messages(question, ctx_txt, entity)
-        try:
-            return tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True
-            )
-        except Exception:
-            pass
-    return PROMPT_TMPL.format(
-        q=question, ctx=ctx_txt, disc=DISCLAIMER, entity=(entity or "this condition")
-    )
-
-# --------- Deterministic, relation-aware summarizer ----------
-
-def summarize_answer_from_facts(ctx_rows: pd.DataFrame, entity: str | None,
-                                requested_intent: str, eff_intent: str,
-                                max_sents: int = 5) -> str:
-    """
-    Deterministic, grammar-safe summarizer. Keeps outputs entity-locked and clear.
-    """
-    ent = (entity or "").strip()
-    if not ent:
-        return "I don't have enough grounded information about the specific condition to summarize treatments."
-
-    # exact-ish entity regex (HIV won't match 'hives')
-    def _compile_entity_regex_exact(e: str) -> re.Pattern:
-        words = e.split()
-        def tok(w: str) -> str:
-            is_acronym = (w.isupper() and len(w) <= 6) or len(w) <= 3
-            if is_acronym:
-                return r"\b" + re.escape(w) + r"\b"
-            return r"\b" + re.escape(w) + r"(?:s|es)?\b"
-        if len(words) == 1:
-            return re.compile(tok(words[0]), flags=re.I)
-        prefix = r"\b" + r"\s+".join(map(re.escape, words[:-1])) + r"\s+"
-        last = tok(words[-1]).lstrip(r"\b")
-        return re.compile(prefix + last, flags=re.I)
-
-    ent_rx = _compile_entity_regex_exact(ent)
-
-    def fix(s: str) -> str:
-        s = (s or "").strip()
-        s = re.sub(r"\s+", " ", s)
-        s = re.sub(r"\s+([,.;:?!])", r"\1", s)
-        s = re.sub(r"\bthe the\b", "the", s, flags=re.I)
-        s = re.sub(r"\bis is\b", "is", s, flags=re.I)
-        s = re.sub(r"\bare is\b", "are", s, flags=re.I)
-        s = re.sub(r"\bis are\b", "are", s, flags=re.I)
-        s = re.sub(r"\b(hiv)\b", "HIV", s, flags=re.I)
-        if not s.endswith((".", "!", "?")):
-            s += "."
-        return s[:1].upper() + s[1:]
-
-    def copula_for(head: str) -> str:
-        if re.search(r"\b(drugs|medicines|medications|steroids|antiretrovirals|antivirals|antibiotics)\b", head, re.I) or head.rstrip().endswith("s"):
-            return "are"
-        return "is"
-
-    BAD_HEAD = re.compile(r"\b(diagnos|monitor|doctor will|exercise|exercises|stand about|podiatrist|know when)\b", re.I)
-    def mentions_ent(s: str) -> bool:
-        return bool(ent_rx.search(s or ""))
-
-    def sent_treat(h, t) -> str | None:
-        h, t = _sanitize(h), _sanitize(t)
-        if BAD_HEAD.search(h):
-            return None
-        if re.search(r"\bused to\b", h, re.I):
-            cop = copula_for(h)
-            h = re.sub(r"\b(is|are|was|were)?\s*(mainly\s+)?used\s+to\b", f"{cop} used to treat", h, flags=re.I)
-            return fix(f"{h} {ent}")
-        if not re.search(r"\btreat\b", h, re.I):
-            return fix(f"{h} {copula_for(h)} used to treat {ent}")
-        if not mentions_ent(h) and mentions_ent(t):
-            return fix(f"{h} {t}")
-        return fix(h)
-
-    def sent_caused_by(h, t) -> str | None:
-        h, t = _sanitize(h), _sanitize(t)
-        if mentions_ent(h) and not mentions_ent(t):
-            h_clean = re.sub(r"\s+(be|is|are)\s*$", "", h, flags=re.I)
-            return fix(f"{h_clean} is caused by {t}")
-        if mentions_ent(t):
-            return fix(f"{ent} can be caused by {h}")
-        return None
-
-    def sent_symptom_of(h, t) -> str | None:
-        h, t = _sanitize(h), _sanitize(t)
-        if mentions_ent(t):
-            return fix(f"Symptoms of {ent} may include {h}")
-        if mentions_ent(h):
-            return fix(f"{h} may be a symptom of {t}")
-        return None
-
-    def sent_side_effect(h, t) -> str | None:
-        h, t = _sanitize(h), _sanitize(t)
-        if mentions_ent(t):
-            return fix(f"{h} can be a side effect of treatments for {ent}")
-        if mentions_ent(h):
-            return fix(f"{h} can be a side effect of {t}")
-        return None
-
-    buckets = {"treats": [], "caused_by": [], "symptom_of": [], "side_effect": [], "other": []}
-    for _, r in ctx_rows.iterrows():
-        h = str(r.get("head", "") or "")
-        rel = str(r.get("relation", "") or "").strip().lower()
-        t = str(r.get("tail", "") or "")
-
-        if not (mentions_ent(h) or mentions_ent(t)):
-            continue
-
-        if rel.startswith("treat"):
-            s = sent_treat(h, t)
-            if s: buckets["treats"].append(s)
-        elif rel.startswith("cause"):
-            s = sent_caused_by(h, t)
-            if s: buckets["caused_by"].append(s)
-        elif rel.startswith("symptom"):
-            s = sent_symptom_of(h, t)
-            if s: buckets["symptom_of"].append(s)
-        elif rel.startswith("side"):
-            s = sent_side_effect(h, t)
-            if s: buckets["side_effect"].append(s)
-        else:
-            txt = _sanitize(h + " " + rel + " " + t).strip()
-            if txt:
-                buckets["other"].append(fix(txt))
-
-    order_map = {
-        "treats":      ["treats", "caused_by", "symptom_of", "side_effect", "other"],
-        "caused_by":   ["caused_by", "treats", "symptom_of", "side_effect", "other"],
-        "symptom_of":  ["symptom_of", "treats", "caused_by", "side_effect", "other"],
-        "side_effect": ["side_effect", "treats", "caused_by", "symptom_of", "other"],
-        "general":     ["treats", "caused_by", "symptom_of", "side_effect", "other"],
-    }
-    pick_order = order_map.get(requested_intent, order_map["general"])
-
-    out, seen = [], set()
-    for key in pick_order:
-        for s in buckets[key]:
-            k = s.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(s)
-            if len(out) >= max_sents:
-                break
-        if len(out) >= max_sents:
-            break
-
-    if requested_intent == "treats" and not buckets["treats"]:
-        if out:
-            out.insert(0, f"I don't have treatment-specific facts for {ent}. Here are other grounded facts.")
-        else:
-            return f"I don't have enough grounded information to answer treatments for {ent}."
-
-    if not out:
-        return "I don't have enough grounded information to answer that from the available knowledge graph."
-    return " ".join(out[:max_sents])
-
-# -----------------------------------------------------
-
-def _call_pipe(pipe, prompt: str) -> str:
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(lambda: pipe(prompt)[0]["generated_text"])
-        return fut.result(timeout=GEN_TIMEOUT_SECS)
-
-def generate_answer(pipe, question: str, ctx_txt: str, entity: str | None) -> str:
-    tok = getattr(pipe, "tokenizer_ref", None) or getattr(pipe, "tokenizer", None)
-    prompt = build_prompt(question, ctx_txt, entity, tok)
-    try:
-        raw = _call_pipe(pipe, prompt)
-    except FuturesTimeout:
-        print(f"[WARN] Generation exceeded {GEN_TIMEOUT_SECS}s; falling back to KG-only.")
-        return ""
-    except Exception as e:
-        print(f"[WARN] Generation error: {e}")
-        return ""
-    keep = extract_three_sections(raw)
-    if keep and not output_looks_sus(keep):
-        return keep
-    try:
-        raw2 = _call_pipe(pipe, prompt)
-        keep2 = extract_three_sections(raw2)
-        if keep2 and not output_looks_sus(keep2):
-            return keep2
-    except Exception as e:
-        print(f"[WARN] Retry generation error: {e}")
-    return ""
-
-# ============================== App ==============================
-
-TRIPLES = load_triples(CONTEXT_CSV)
+# =============== Gradio chat function ===============
 
 def chat_answer(question: str, history):
     if emergency_filter(question):
-        return ("[Answer]\nThis may be urgent. Please seek immediate medical attention or "
-                "contact local emergency services.\n\n[Facts Used]\n(none)\n\n[Disclaimer]\n" + DISCLAIMER)
-
-    intent = classify_intent(question)
-    entity = pick_main_entity(TRIPLES, question)
-    # Trust obvious mentions (e.g., HIV) if KG couldn’t resolve
-    if not entity:
-        qlow = question.lower()
-        if "hiv" in qlow:
-            entity = "hiv"
-        else:
-            m_acr = re.search(r"\b[A-Z]{2,5}\b", question)
-            if m_acr:
-                entity = m_acr.group(0).lower()
-
-    ctx_rows, eff_intent, _tried = retrieve_with_cascade(
-        TRIPLES, question, intent=intent, main_entity=entity, k=TOP_K
-    )
-
-    if ctx_rows is None or ctx_rows.empty:
         return (
-            "[Answer]\nI don't have enough grounded information to answer that from the available knowledge graph.\n\n"
-            "[Facts Used]\n(none)\n\n"
-            f"[Disclaimer]\n{DISCLAIMER}"
+            "[Answer]\nThis may be urgent. Please seek immediate medical attention or contact local emergency services.\n\n"
+            "[Facts Used]\n(none)\n\n[Disclaimer]\n" + DISCLAIMER
         )
 
-    ctx_txt = format_context(ctx_rows)
+    # Load triples
+    try:
+        df = pd.read_csv(CONTEXT_CSV)
+    except Exception as e:
+        return (
+            "[Answer]\nI couldn't load the knowledge graph file.\n\n[Facts Used]\n(none)\n\n[Disclaimer]\n" + DISCLAIMER
+        )
+    df.columns = [c.lower() for c in df.columns]
+    if not set(["head","relation","tail"]).issubset(df.columns):
+        return (
+            "[Answer]\nThe knowledge graph CSV is missing required columns (head, relation, tail).\n\n[Facts Used]\n(none)\n\n[Disclaimer]\n" + DISCLAIMER
+        )
+
+    intent = classify_intent(question)
+    entity = detect_entity(question)
+
+    triples = select_triples(df, question, intent, entity, max_triples=20)
+    if not triples:
+        return (
+            "[Answer]\nI don't have enough grounded information to answer that from the available knowledge graph.\n\n"
+            "[Facts Used]\n(none)\n\n[Disclaimer]\n" + DISCLAIMER
+        )
+
+    # Try LLM generation with knowledge-constrained prompt
     pipe = ensure_pipe()
-    if pipe is None:
-        return kg_only_response(ctx_rows)
+    if pipe is not None:
+        try:
+            prompt = build_prompt(question, triples, bullets=BULLETS_DEFAULT, intent=intent)
+            out = pipe(prompt, max_new_tokens=MAX_NEW_TOKENS)[0]["generated_text"]
+            bullets = post_process_no_disc(out)
+        except Exception:
+            bullets = kg_only_answer(triples, intent, entity)
+    else:
+        bullets = kg_only_answer(triples, intent, entity)
 
-    out = generate_answer(pipe, question, ctx_txt, entity)
-    if not out:
-        answer_text = summarize_answer_from_facts(ctx_rows, entity, requested_intent=intent, eff_intent=eff_intent, max_sents=3)
-        ent_rx = _compile_entity_regex(entity) if entity else None
-        bullets = []
-        for h, r, t in ctx_rows[["head", "relation", "tail"]].values:
-            hs, rs, ts = _sanitize(str(h)), _sanitize(str(r)), _sanitize(str(t))
-            if ent_rx is None or ent_rx.search(hs) or ent_rx.search(ts):
-                bullets.append(f"- [H:{hs} | R:{rs} | T:{ts}]")
-            if len(bullets) >= 6:
-                break
-        if not bullets:
-            for h, r, t in ctx_rows[["head", "relation", "tail"]].values[:3]:
-                bullets.append(f"- [H:{_sanitize(str(h))} | R:{_sanitize(str(r))} | T:{_sanitize(str(t))}]")
-        out = "[Answer]\n" + answer_text + "\n\n[Facts Used]\n" + "\n".join(bullets) + "\n\n[Disclaimer]\n" + DISCLAIMER
-    return out
+    # Facts Used block (first 6 triples)
+    facts = []
+    for h, r, t in triples[:6]:
+        facts.append(f"- [H:{_sanitize(h)} | R:{_sanitize(r)} | T:{_sanitize(t)}]")
 
+    return (
+        "[Answer]\n" + bullets + "\n\n" +
+        "[Facts Used]\n" + ("\n".join(facts) if facts else "(none)") + "\n\n" +
+        "[Disclaimer]\n" + DISCLAIMER
+    )
+
+# =============== UI ===============
 with gr.Blocks() as demo:
     gr.Markdown("# TrustMed AI — Conversational Agent")
     gr.Markdown(
@@ -772,13 +370,12 @@ with gr.Blocks() as demo:
         "It is not a substitute for professional medical advice."
     )
     examples = [
-        "What are the treatments for a kidney infection?",
-        "What are the side effects of antibiotics?",
+        "How is type 2 diabetes managed?",
+        "What are the treatments for strep throat?",
+        "Which medicines treat hay fever?",
         "What causes tonsillitis?",
         "What are symptoms of a UTI in children?",
-        "How do you treat hay fever?",
-        "How is Strep A treated?",
-        "What causes VTEC O157 infections?"
+        "What are the side effects of antibiotics?",
     ]
     gr.ChatInterface(
         fn=chat_answer,
@@ -787,13 +384,10 @@ with gr.Blocks() as demo:
         type="messages",
     )
 
-# --- launch (public link)
 if __name__ == "__main__":
     demo.launch(share=True)
 
+# export CONTEXT_CSV="kg_out/triples_clean.csv"
 # export BASE_MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-# export ADAPTER_DIR="kg_lora_out_chat"
-# export SKIP_LORA=0
-# export FORCE_DEVICE=cpu
-# export MAX_NEW_TOKENS=160
-# python app.py
+# export ADAPTER_DIR="kg_lora_out"
+# (venv) srirupin@Potulas-MacBook-Pro Maked code % python app.py
