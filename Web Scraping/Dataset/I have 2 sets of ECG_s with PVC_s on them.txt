@@ -1,0 +1,13 @@
+Topic: I have 2 sets of ECG’s with PVC’s on them
+URL: https://community.patient.info/t/i-have-2-sets-of-ecg-s-with-pvc-s-on-them/797073
+
+--- Post 1 ---
+Author: None
+Timestamp: None
+Content:
+One set of three, feature 3 pvcs, 0 pvcs, and 3pvcs.
+The other set of three feature 4 pvcs, 3 pvcs, and 1 pvc.
+My question is whether these could therefore be from the same patient on the same day?
+Or is there a difference between the two sets which means that is not likely?
+Basically, I have been told by medical professional A that the first set shows a healthier person than the second set, whereas medical professional B tells me that the number of pvcs will always be slightly different from one ecg to the next, and that there is no way professional A could make such a statement. He tells me that for all we know, the first set might have been bookended by ecg 4 and 5 which showed 4 pvcs in each, as it is not an exact science, and any claim that there is a substantial or even mediocre difference between both sets is ludicrous. They BOTH show the same issue - pvcs.
+
