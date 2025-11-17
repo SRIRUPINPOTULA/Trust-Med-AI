@@ -34,6 +34,39 @@ The agent integrates medical information from reputable websites and communities
 - [Mayo Clinic](https://connect.mayoclinic.org/groups)  
 - **Ontologies:** Uses **UMLS** for medical entity alignment and knowledge integration.
 
+
+---
+
+## 🧰 Data Collection Scripts
+
+This repository includes multiple Python scripts for scraping and collecting medical discussions and articles from **trusted community and medical sources**.  
+These scripts serve as the **data ingestion layer** for building the Knowledge Graph (KG).
+
+| **Script** | **Source / Target** | **Description** | **Output Format** |
+|-------------|----------------------|------------------|--------------------|
+| `reddit_scraper.py` | Reddit (`r/diabetes`, `r/AskDocs`) | Scrapes posts and comments, saves structured post text and metadata. | `.txt` |
+| `scraper.py` / `scraper2.py` | Reddit (post URLs CSV) | Extracts full text content for Reddit posts from a list of URLs. | `.csv` / `.txt` |
+| `patients_like_me.py` | PatientsLikeMe | Fetches health condition details, titles, and meta-information. | Console / `.txt` |
+| `a.py` | WebMD (main page) | Crawls and extracts diabetes-related article links. | `.csv` |
+| `b.py` | WebMD (article pages) | Scrapes article titles and text bodies from stored links. | `.csv` |
+
+### 🪄 Usage Example
+
+Each script is standalone — just run:
+
+```bash
+python reddit_scraper.py
+```
+or specify input/output files as needed.
+
+Make sure you have the required dependencies installed:
+```bash
+pip install requests beautifulsoup4 pandas
+```
+⚠️ Notes
+- Respect website terms of service and robots.txt.
+- Use polite delays (time.sleep()) to avoid rate limiting.
+- Collected data feeds directly into Knowledge Graph construction for downstream tasks.
 ---
 
 ## 🛠️ Tools & Technologies
